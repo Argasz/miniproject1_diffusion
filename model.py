@@ -1,21 +1,26 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import Dataset
+from PIL import Image
+from torchvision.utils import make_grid
+import time
 
 
 from data import load_dataset_and_make_dataloaders
 from data import DataInfo
-
-gpu = torch.cuda.is_available()
-device = torch.device('cuda:0' if gpu else 'cpu')
- 
-dl, info = load_dataset_and_make_dataloaders(
-    dataset_name='FashionMNIST',
-    root_dir='data', # choose the directory to store the data 
-    batch_size=32,
-    num_workers=0,   # you can use more workers if you see the GPU is waiting for the batches
-    pin_memory=gpu,  # use pin memory if you're planning to move the data to GPU
-)
+if __name__ == '__main__':
+    gpu = torch.cuda.is_available()
+    device = torch.device('cuda:0' if gpu else 'cpu')
+    batch_size = 256
+    
+    dl, info = load_dataset_and_make_dataloaders(
+        dataset_name='FashionMNIST',
+        root_dir='data', # choose the directory to store the data 
+        batch_size=batch_size,
+        num_workers=6,   # you can use more workers if you see the GPU is waiting for the batches
+        pin_memory=gpu,  # use pin memory if you're planning to move the data to GPU
+    )
 
 class Model(nn.Module):
     def __init__(
@@ -32,7 +37,7 @@ class Model(nn.Module):
         self.conv_out = nn.Conv2d(nb_channels, image_channels, kernel_size=3, padding=1)
     
     def forward(self, noisy_input: torch.Tensor, c_noise: torch.Tensor) -> torch.Tensor:
-        cond = self.noise_emb(c_noise) # TODO: not used yet
+        #cond = self.noise_emb(c_noise) # TODO: not used yet
         x = self.conv_in(noisy_input)
         for block in self.blocks:
             x = block(x)
@@ -85,19 +90,40 @@ def build_sigma_schedule(steps, rho=7, sigma_min=2e-3, sigma_max=80):
     sigmas = (max_inv_rho + torch.linspace(0, 1, steps) * (min_inv_rho - max_inv_rho)) ** rho
     return sigmas
 
-def train_model(loader, info: DataInfo, model : nn.Module, nb_epochs):
-    for _ in range(nb_epochs):
-        for x, y in loader:
-            sigma = sample_sigma(32)
-            noisy = x + torch.normal(0, info.sigma_data)
-            c_in = sigma_in(sigma, info.sigma_data)
-            c_out = sigma_out(sigma, info.sigma_data)
-            c_skip = sigma_skip(sigma, info.sigma_data)
-            c_noise = sigma_noise(sigma, info.sigma_data)
-            res = model.forward(noisy, c_noise)
-            l = nn.MSELoss()
+def train_model(loader: Dataset, info: DataInfo, model : nn.Module, nb_epochs):
+    opt = torch.optim.Adam(model.parameters())
+    for e in range(nb_epochs):
+        acc_loss = 0
+        if e == nb_epochs / 2: #Save one checkpoint for now
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            torch.save({
+                'epoch' : e,
+                'model_state_dict' : model.state_dict(),
+                'optimizier_state_dict' : opt.state_dict(),
+                'loss': l
+            }, f'./checkpoints/checkpoint_{timestamp}.tar')
+        crit = nn.MSELoss()
+        for load in loader:
+            x = load[0]
+            x = x.to(device)
+            opt.zero_grad()
+            sigma = sample_sigma(x.shape[0])
+            noisy = x + torch.normal(0, info.sigma_data, size=x.shape).to(device)
+            c_in = sigma_in(sigma, info.sigma_data).to(device).view(noisy.shape[0], 1, 1, 1)
+            c_out = sigma_out(sigma, info.sigma_data).to(device).view(noisy.shape[0], 1, 1, 1)
+            c_skip = sigma_skip(sigma, info.sigma_data).to(device).view(noisy.shape[0], 1, 1, 1)
+            c_noise = sigma_noise(sigma).to(device).reshape(noisy.shape[0], 1, 1, 1)
+            res = model.forward(c_in * noisy, c_noise)
+            l = crit(res, (x - c_skip * noisy) / c_out)
+            acc_loss += l.item()
+            l.backward()
+            opt.step()
 
-           
+
+def sample_denoised(D):
+    sigmas = build_sigma_schedule(100)
+    return euler_sampling(sigmas, D)
+
 
 def euler_sampling(sigmas, D):
     x = torch.randn(8, 1, 32, 32) * sigmas[0]  # Initialize with pure gaussian noise ~ N(0, sigmas[0])
@@ -114,3 +140,16 @@ def euler_sampling(sigmas, D):
         
         x = x + d * (sigma_next - sigma)  # Perform one step of Euler's method
     return x
+
+if __name__ == '__main__': # To allow multiple worker threads in data-loading
+    model = Model(info.image_channels, 32, 1, 1)
+    model = model.to(device)
+    input = dl[0]
+    train_model(input, info, model, 1000)
+    torch.save(model.state_dict(), './diffusion_model.pth')
+    denoised_image =sample_denoised(model)
+
+    img = denoised_image.clamp(-1, 1).add(1).div(2).mul(255).byte()  # [-1., 1.] -> [0., 1.] -> [0, 255]
+    img = make_grid(img)
+    img = Image.fromarray(img.permute(1, 2, 0).cpu().numpy())
+    img.save('./test', '.jpg')
