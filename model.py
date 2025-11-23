@@ -42,6 +42,7 @@ class Model(nn.Module):
         for block in self.blocks:
             x = block(x)
         return self.conv_out(x)
+        
 
 
 class NoiseEmbedding(nn.Module):
@@ -69,13 +70,13 @@ class ResidualBlock(nn.Module): # Skip
         y = self.conv2(F.relu(self.norm2(y)))
         return x + y
 
-def sigma_in(sigma, sigma_data):
+def sigma_in(sigma, sigma_data=0.6627):
     return 1 / torch.sqrt(sigma_data ** 2 + sigma ** 2)
 
-def sigma_out(sigma, sigma_data):
+def sigma_out(sigma, sigma_data = 0.6627):
     return sigma * sigma_data / torch.sqrt(sigma**2 + sigma_data ** 2)
 
-def sigma_skip(sigma, sigma_data):
+def sigma_skip(sigma, sigma_data = 0.6627): # Magic number from the data, fix later
     return sigma_data ** 2 / sigma_data**2 + sigma ** 2
 
 def sigma_noise(sigma):
@@ -119,19 +120,22 @@ def train_model(loader: Dataset, info: DataInfo, model : nn.Module, nb_epochs):
             l.backward()
             opt.step()
 
+def denoise(x, sigma, model):
+    return sigma_skip(sigma) * x + sigma_out(sigma) * model.forward(sigma_in(sigma) * x, sigma_noise(sigma))
 
-def sample_denoised(D):
+def sample_denoised(model, device):
     sigmas = build_sigma_schedule(100)
-    return euler_sampling(sigmas, D)
+    return euler_sampling(sigmas, model, device)
 
 
-def euler_sampling(sigmas, D):
+def euler_sampling(sigmas, model, device): # TODO: This overflows
+    denoise_steps = []
     x = torch.randn(8, 1, 32, 32) * sigmas[0]  # Initialize with pure gaussian noise ~ N(0, sigmas[0])
-
+    x = x.to(device)
     for i, sigma in enumerate(sigmas):
         
         with torch.no_grad():
-            x_denoised = D(x, sigma)  
+            x_denoised = denoise(x, sigma, model)  
             # Where D(x, sigma) = cskip(sigma) * x + cout(sigma) * F(cin(sigma) * x, cnoise(sigma)) 
             # and F(.,.) is your neural network
         
@@ -139,17 +143,12 @@ def euler_sampling(sigmas, D):
         d = (x - x_denoised) / sigma
         
         x = x + d * (sigma_next - sigma)  # Perform one step of Euler's method
-    return x
+        denoise_steps.append(x_denoised.cpu())
+    return x, denoise_steps
 
 if __name__ == '__main__': # To allow multiple worker threads in data-loading
-    model = Model(info.image_channels, 32, 1, 1)
+    model = Model(info.image_channels, 32, 1, 2)
     model = model.to(device)
     input = dl[0]
     train_model(input, info, model, 1000)
     torch.save(model.state_dict(), './diffusion_model.pth')
-    denoised_image =sample_denoised(model)
-
-    img = denoised_image.clamp(-1, 1).add(1).div(2).mul(255).byte()  # [-1., 1.] -> [0., 1.] -> [0, 255]
-    img = make_grid(img)
-    img = Image.fromarray(img.permute(1, 2, 0).cpu().numpy())
-    img.save('./test', '.jpg')
