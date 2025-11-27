@@ -37,10 +37,10 @@ class Model(nn.Module):
         self.conv_out = nn.Conv2d(nb_channels, image_channels, kernel_size=3, padding=1)
     
     def forward(self, noisy_input: torch.Tensor, c_noise: torch.Tensor) -> torch.Tensor:
-        #cond = self.noise_emb(c_noise) # TODO: not used yet
+        cond = self.noise_emb(c_noise) # TODO: not used yet
         x = self.conv_in(noisy_input)
         for block in self.blocks:
-            x = block(x)
+            x = block(x, cond)
         return self.conv_out(x)
         
 
@@ -54,19 +54,22 @@ class NoiseEmbedding(nn.Module):
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         assert input.ndim == 1
         f = 2 * torch.pi * input.unsqueeze(1) @ self.weight
-        return torch.cat([f.cos(), f.sin()], dim=-1)
+        return torch.cat([f.cos(), f.sin()], dim=-1) # Creating sinusoidal signature for each noise level
 
 
 class ResidualBlock(nn.Module): # Skip
     def __init__(self, nb_channels: int) -> None:
         super().__init__()
+        self.noise_level_projection = nn.Linear(2, nb_channels)
         self.norm1 = nn.BatchNorm2d(nb_channels)
         self.conv1 = nn.Conv2d(nb_channels, nb_channels, kernel_size=3, stride=1, padding=1)
         self.norm2 = nn.BatchNorm2d(nb_channels)
         self.conv2 = nn.Conv2d(nb_channels, nb_channels, kernel_size=3, stride=1, padding=1)
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, noise_cond: torch.Tensor) -> torch.Tensor:
         y = self.conv1(F.relu(self.norm1(x)))
+        noise_proj = self.noise_level_projection(noise_cond).unsqueeze(-1).unsqueeze(-1)
+        y = y + noise_proj
         y = self.conv2(F.relu(self.norm2(y)))
         return x + y
 
@@ -77,7 +80,7 @@ def sigma_out(sigma, sigma_data = 0.6627):
     return sigma * sigma_data / torch.sqrt(sigma**2 + sigma_data ** 2)
 
 def sigma_skip(sigma, sigma_data = 0.6627): # Magic number from the data, fix later
-    return sigma_data ** 2 / sigma_data**2 + sigma ** 2
+    return sigma_data ** 2 / (sigma_data**2 + sigma ** 2)
 
 def sigma_noise(sigma):
     return torch.log(sigma)/4
@@ -94,7 +97,6 @@ def build_sigma_schedule(steps, rho=7, sigma_min=2e-3, sigma_max=80):
 def train_model(loader: Dataset, info: DataInfo, model : nn.Module, nb_epochs):
     opt = torch.optim.Adam(model.parameters())
     for e in range(nb_epochs):
-        acc_loss = 0
         if e == nb_epochs / 2: #Save one checkpoint for now
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             torch.save({
@@ -108,23 +110,25 @@ def train_model(loader: Dataset, info: DataInfo, model : nn.Module, nb_epochs):
             x = load[0]
             x = x.to(device)
             opt.zero_grad()
-            sigma = sample_sigma(x.shape[0])
-            noisy = x + torch.normal(0, info.sigma_data, size=x.shape).to(device)
-            c_in = sigma_in(sigma, info.sigma_data).to(device).view(noisy.shape[0], 1, 1, 1)
-            c_out = sigma_out(sigma, info.sigma_data).to(device).view(noisy.shape[0], 1, 1, 1)
-            c_skip = sigma_skip(sigma, info.sigma_data).to(device).view(noisy.shape[0], 1, 1, 1)
-            c_noise = sigma_noise(sigma).to(device).reshape(noisy.shape[0], 1, 1, 1)
+
+            sigma = sample_sigma(x.shape[0]).to(device)
+            noise = torch.normal(mean=torch.zeros(x.shape), std=torch.ones(x.shape)).to(device)
+            noisy = x + noise * sigma.view(x.shape[0], 1, 1, 1)
+
+            c_in = sigma_in(sigma, info.sigma_data).to(device).view(x.shape[0], 1, 1, 1)
+            c_out = sigma_out(sigma, info.sigma_data).to(device).view(x.shape[0], 1, 1, 1)
+            c_skip = sigma_skip(sigma, info.sigma_data).to(device).view(x.shape[0], 1, 1, 1)
+            c_noise = sigma_noise(sigma).to(device)
             res = model.forward(c_in * noisy, c_noise)
             l = crit(res, (x - c_skip * noisy) / c_out)
-            acc_loss += l.item()
             l.backward()
             opt.step()
 
-def denoise(x, sigma, model):
-    return sigma_skip(sigma) * x + sigma_out(sigma) * model.forward(sigma_in(sigma) * x, sigma_noise(sigma))
+def denoise(x, sigma, model, device):
+    return sigma_skip(sigma) * x + sigma_out(sigma) * model.forward(sigma_in(sigma) * x, sigma_noise(sigma).unsqueeze(0).to(device))
 
 def sample_denoised(model, device):
-    sigmas = build_sigma_schedule(100)
+    sigmas = build_sigma_schedule(1000)
     return euler_sampling(sigmas, model, device)
 
 
@@ -135,10 +139,9 @@ def euler_sampling(sigmas, model, device): # TODO: This overflows
     for i, sigma in enumerate(sigmas):
         
         with torch.no_grad():
-            x_denoised = denoise(x, sigma, model)  
+            x_denoised = denoise(x, sigma, model, device)  
             # Where D(x, sigma) = cskip(sigma) * x + cout(sigma) * F(cin(sigma) * x, cnoise(sigma)) 
             # and F(.,.) is your neural network
-        
         sigma_next = sigmas[i + 1] if i < len(sigmas) - 1 else 0
         d = (x - x_denoised) / sigma
         
@@ -151,4 +154,5 @@ if __name__ == '__main__': # To allow multiple worker threads in data-loading
     model = model.to(device)
     input = dl[0]
     train_model(input, info, model, 1000)
-    torch.save(model.state_dict(), './diffusion_model.pth')
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    torch.save(model.state_dict(), f'./diffusion_model{timestamp}.pth')
