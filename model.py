@@ -1,3 +1,4 @@
+from typing import Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -33,14 +34,20 @@ class Model(nn.Module):
         super().__init__()
         self.noise_emb = NoiseEmbedding(cond_channels)
         self.conv_in = nn.Conv2d(image_channels, nb_channels, kernel_size=3, padding=1)
-        self.blocks = nn.ModuleList([ResidualBlock(nb_channels) for _ in range(num_blocks)])
+        #self.blocks = nn.ModuleList([ResidualBlock(nb_channels, cond_channels) for _ in range(num_blocks)])
+        self.downres1 = DownResBlock(nb_channels, nb_channels* 2, cond_channels, 2)
+        self.downres2 = DownResBlock(nb_channels * 2, nb_channels * 4, cond_channels, 2)
+        self.up1 = UpResBlock(nb_channels * 4, nb_channels * 2, (16 , 16), cond_channels, 2)
+        self.up2 = UpResBlock(nb_channels * 2, nb_channels, (32, 32), cond_channels)
         self.conv_out = nn.Conv2d(nb_channels, image_channels, kernel_size=3, padding=1)
     
     def forward(self, noisy_input: torch.Tensor, c_noise: torch.Tensor) -> torch.Tensor:
-        cond = self.noise_emb(c_noise) # TODO: not used yet
-        x = self.conv_in(noisy_input)
-        for block in self.blocks:
-            x = block(x, cond)
+        cond = self.noise_emb(c_noise)
+        x_in = self.conv_in(noisy_input)
+        x_1 = self.downres1(x_in, cond)
+        x_2 = self.downres2(x_1, cond)
+        x = self.up1(x_2, x_1, cond)
+        x = self.up2(x, x_2, cond)
         return self.conv_out(x)
         
 
@@ -49,30 +56,64 @@ class NoiseEmbedding(nn.Module):
     def __init__(self, cond_channels: int) -> None:
         super().__init__()
         assert cond_channels % 2 == 0
-        self.register_buffer('weight', torch.randn(1, cond_channels // 2))
+        self.register_buffer('weight', torch.randn(1, cond_channels // 2)) # Random projection matrix
     
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         assert input.ndim == 1
         f = 2 * torch.pi * input.unsqueeze(1) @ self.weight
-        return torch.cat([f.cos(), f.sin()], dim=-1) # Creating sinusoidal signature for each noise level
+        return torch.cat([f.cos(), f.sin()], dim=-1) 
 
 
-class ResidualBlock(nn.Module): # Skip
-    def __init__(self, nb_channels: int) -> None:
+class ResidualBlock(nn.Module):
+    def __init__(self, nb_channels_in: int, nb_channels_out: int, cond_channels: int) -> None:
         super().__init__()
-        self.noise_level_projection = nn.Linear(2, nb_channels)
-        self.norm1 = nn.BatchNorm2d(nb_channels)
-        self.conv1 = nn.Conv2d(nb_channels, nb_channels, kernel_size=3, stride=1, padding=1)
-        self.norm2 = nn.BatchNorm2d(nb_channels)
-        self.conv2 = nn.Conv2d(nb_channels, nb_channels, kernel_size=3, stride=1, padding=1)
+        self.noise_mlp = nn.Sequential(nn.Linear(cond_channels, nb_channels_in*4), nn.ReLU(), nn.Linear(nb_channels_in*4, nb_channels_in*4))
+        self.noise_proj = nn.Linear(nb_channels_in*4, 2*nb_channels_in)
+        self.norm1 = nn.BatchNorm2d(nb_channels_in)
+        self.conv1 = nn.Conv2d(nb_channels_in, nb_channels_out, kernel_size=3, stride=1, padding=1)
+        self.norm2 = nn.BatchNorm2d(nb_channels_out)
+        self.conv2 = nn.Conv2d(nb_channels_out, nb_channels_out, kernel_size=3, stride=1, padding=1)
+        self.dim = nn.Identity()
+        if nb_channels_in != nb_channels_out:
+            self.dim = nn.Conv2d(nb_channels_in, nb_channels_out, 1)
     
     def forward(self, x: torch.Tensor, noise_cond: torch.Tensor) -> torch.Tensor:
-        y = self.conv1(F.relu(self.norm1(x)))
-        noise_proj = self.noise_level_projection(noise_cond).unsqueeze(-1).unsqueeze(-1)
-        y = y + noise_proj
+        noise_emb = self.noise_mlp(noise_cond)
+        noise_proj = self.noise_proj(noise_emb)
+        gamma, beta = torch.split(noise_proj, noise_proj.shape[1]//2, dim=1)
+        gamma = gamma.unsqueeze(-1).unsqueeze(-1)
+        beta = beta.unsqueeze(-1).unsqueeze(-1)
+        y = gamma * self.norm1(x) + beta
+        y = self.conv1(F.relu(y))
         y = self.conv2(F.relu(self.norm2(y)))
-        return x + y
+        return self.dim(x) + y
+    
+class DownResBlock(nn.Module):
+    def __init__(self, nb_channels_in:int, nb_channels_out: int, cond_channels: int, num_blocks:int = 2, downsample_stride= 2) -> None:
+        super().__init__()
+        self.block1 = ResidualBlock(nb_channels_in, nb_channels_out, cond_channels)
+        self.block2 = ResidualBlock(nb_channels_out, nb_channels_out, cond_channels)
+        self.downsample = nn.Conv2d(nb_channels_out, nb_channels_out, kernel_size=3, stride=downsample_stride, padding=1)
+    
+    def forward(self, x: torch.Tensor, noise_cond: torch.Tensor):
+        x = self.block1(x, noise_cond)
+        x = self.block2(x, noise_cond)
+        return self.downsample(x)
 
+class UpResBlock(nn.Module):
+    def __init__(self, nb_channels_in: int, nb_channels_out: int,  out_size: Tuple[int, int], cond_channels: int, num_blocks: int = 2):
+        super().__init__()
+        self.block1 = ResidualBlock(nb_channels_in, nb_channels_out, cond_channels)
+        self.block2 = ResidualBlock(nb_channels_out, nb_channels_out, cond_channels)
+        self.out_size = out_size
+    def forward(self, x: torch.Tensor, skip: torch.Tensor, noise_cond: torch.Tensor):
+        x = F.interpolate(x, self.out_size)
+        x = torch.cat((x, skip), dim=1)
+        x = self.block1(x, noise_cond)
+        x = self.block2(x, noise_cond)
+        return x
+        
+        
 def sigma_in(sigma, sigma_data=0.6627):
     return 1 / torch.sqrt(sigma_data ** 2 + sigma ** 2)
 
@@ -132,7 +173,7 @@ def sample_denoised(model, device):
     return euler_sampling(sigmas, model, device)
 
 
-def euler_sampling(sigmas, model, device): # TODO: This overflows
+def euler_sampling(sigmas, model, device):
     denoise_steps = []
     x = torch.randn(8, 1, 32, 32) * sigmas[0]  # Initialize with pure gaussian noise ~ N(0, sigmas[0])
     x = x.to(device)
@@ -150,9 +191,9 @@ def euler_sampling(sigmas, model, device): # TODO: This overflows
     return x, denoise_steps
 
 if __name__ == '__main__': # To allow multiple worker threads in data-loading
-    model = Model(info.image_channels, 32, 1, 2)
+    model = Model(info.image_channels, 32, 2, 64)
     model = model.to(device)
     input = dl[0]
-    train_model(input, info, model, 1000)
+    train_model(input, info, model, 500)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     torch.save(model.state_dict(), f'./diffusion_model{timestamp}.pth')
