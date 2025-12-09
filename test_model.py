@@ -12,7 +12,7 @@ def save_image(image, fname):
 gpu = torch.cuda.is_available()
 device = torch.device('cuda:0' if gpu else 'cpu')
 
-saved = torch.load('./diffusion_model20251130_151135.pth')
+saved = torch.load('./diffusion_model20251209_122145.pth')
 diffusion = model.Model(1, 32, 2, 64).to(device)
 diffusion.load_state_dict(saved)
 denoised_image, denoise_steps = model.sample_denoised(diffusion, device)

@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 from PIL import Image
 from torchvision.utils import make_grid
+from torch.amp import autocast, GradScaler
 import time
 
 
@@ -23,6 +24,18 @@ if __name__ == '__main__':
         pin_memory=gpu,  # use pin memory if you're planning to move the data to GPU
     )
 
+def check_for_nans(model):
+    for name, param in model.named_parameters():
+        if torch.isnan(param).any():
+            print(f"!! NaN detected in Parameter: {name} !!")
+            return True
+
+    for name, buf in model.named_buffers():
+        if torch.isnan(buf).any():
+            print(f"!! NaN detected in Buffer: {name} !!")
+            return True
+    return False
+
 class Model(nn.Module):
     def __init__(
         self,
@@ -37,17 +50,17 @@ class Model(nn.Module):
         #self.blocks = nn.ModuleList([ResidualBlock(nb_channels, cond_channels) for _ in range(num_blocks)])
         self.downres1 = DownResBlock(nb_channels, nb_channels* 2, cond_channels, 2)
         self.downres2 = DownResBlock(nb_channels * 2, nb_channels * 4, cond_channels, 2)
-        self.up1 = UpResBlock(nb_channels * 4, nb_channels * 2, (16 , 16), cond_channels, 2)
-        self.up2 = UpResBlock(nb_channels * 2, nb_channels, (32, 32), cond_channels)
+        self.up1 = UpResBlock(192, nb_channels * 2, (16 , 16), cond_channels, 2)
+        self.up2 = UpResBlock(96, nb_channels, (32, 32), cond_channels)
         self.conv_out = nn.Conv2d(nb_channels, image_channels, kernel_size=3, padding=1)
     
     def forward(self, noisy_input: torch.Tensor, c_noise: torch.Tensor) -> torch.Tensor:
         cond = self.noise_emb(c_noise)
         x_in = self.conv_in(noisy_input)
-        x_1 = self.downres1(x_in, cond)
-        x_2 = self.downres2(x_1, cond)
-        x = self.up1(x_2, x_1, cond)
-        x = self.up2(x, x_2, cond)
+        x_1, skip_1 = self.downres1(x_in, cond)
+        x_2, skip_2 = self.downres2(x_1, cond)
+        x = self.up1(x_2, skip_2, cond)
+        x = self.up2(x, skip_1, cond)
         return self.conv_out(x)
         
 
@@ -59,9 +72,10 @@ class NoiseEmbedding(nn.Module):
         self.register_buffer('weight', torch.randn(1, cond_channels // 2)) # Random projection matrix
     
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        assert input.ndim == 1
-        f = 2 * torch.pi * input.unsqueeze(1) @ self.weight
-        return torch.cat([f.cos(), f.sin()], dim=-1) 
+        with autocast(device_type=str(device), enabled=False):
+            assert input.ndim == 1
+            f = 2 * torch.pi * input.unsqueeze(1) @ self.weight
+            return torch.cat([f.cos(), f.sin()], dim=-1) 
 
 
 class ResidualBlock(nn.Module):
@@ -91,14 +105,14 @@ class ResidualBlock(nn.Module):
 class DownResBlock(nn.Module):
     def __init__(self, nb_channels_in:int, nb_channels_out: int, cond_channels: int, num_blocks:int = 2, downsample_stride= 2) -> None:
         super().__init__()
-        self.block1 = ResidualBlock(nb_channels_in, nb_channels_out, cond_channels)
-        self.block2 = ResidualBlock(nb_channels_out, nb_channels_out, cond_channels)
-        self.downsample = nn.Conv2d(nb_channels_out, nb_channels_out, kernel_size=3, stride=downsample_stride, padding=1)
+        self.block1 = ResidualBlock(nb_channels_in, nb_channels_in, cond_channels)
+        self.block2 = ResidualBlock(nb_channels_in, nb_channels_in, cond_channels)
+        self.downsample = nn.Conv2d(nb_channels_in, nb_channels_out, kernel_size=3, stride=downsample_stride, padding=1)
     
     def forward(self, x: torch.Tensor, noise_cond: torch.Tensor):
         x = self.block1(x, noise_cond)
         x = self.block2(x, noise_cond)
-        return self.downsample(x)
+        return self.downsample(x), x
 
 class UpResBlock(nn.Module):
     def __init__(self, nb_channels_in: int, nb_channels_out: int,  out_size: Tuple[int, int], cond_channels: int, num_blocks: int = 2):
@@ -137,6 +151,8 @@ def build_sigma_schedule(steps, rho=7, sigma_min=2e-3, sigma_max=80):
 
 def train_model(loader: Dataset, info: DataInfo, model : nn.Module, nb_epochs):
     opt = torch.optim.Adam(model.parameters())
+    scaler = GradScaler()
+    losses = []
     for e in range(nb_epochs):
         if e == nb_epochs / 2: #Save one checkpoint for now
             timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -144,9 +160,11 @@ def train_model(loader: Dataset, info: DataInfo, model : nn.Module, nb_epochs):
                 'epoch' : e,
                 'model_state_dict' : model.state_dict(),
                 'optimizier_state_dict' : opt.state_dict(),
-                'loss': l
+                'loss': loss
             }, f'./checkpoints/checkpoint_{timestamp}.tar')
         crit = nn.MSELoss()
+        batch_count = 0
+        loss = 0
         for load in loader:
             x = load[0]
             x = x.to(device)
@@ -160,10 +178,18 @@ def train_model(loader: Dataset, info: DataInfo, model : nn.Module, nb_epochs):
             c_out = sigma_out(sigma, info.sigma_data).to(device).view(x.shape[0], 1, 1, 1)
             c_skip = sigma_skip(sigma, info.sigma_data).to(device).view(x.shape[0], 1, 1, 1)
             c_noise = sigma_noise(sigma).to(device)
-            res = model.forward(c_in * noisy, c_noise)
-            l = crit(res, (x - c_skip * noisy) / c_out)
-            l.backward()
-            opt.step()
+            with autocast(str(device)):
+                res = model.forward(c_in * noisy, c_noise)
+                loss = crit(res, (x - c_skip * noisy) / c_out)
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+            if batch_count % 50 == 0:
+                if check_for_nans(model):
+                    print('Stopped training due to nans')
+                    break
+            batch_count += 1
+        losses.append(loss)
 
 def denoise(x, sigma, model, device):
     return sigma_skip(sigma) * x + sigma_out(sigma) * model.forward(sigma_in(sigma) * x, sigma_noise(sigma).unsqueeze(0).to(device))
