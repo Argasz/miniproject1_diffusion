@@ -7,6 +7,7 @@ from PIL import Image
 from torchvision.utils import make_grid
 from torch.amp import autocast, GradScaler
 import time
+import numpy as np
 
 
 from data import load_dataset_and_make_dataloaders
@@ -72,7 +73,7 @@ class NoiseEmbedding(nn.Module):
         self.register_buffer('weight', torch.randn(1, cond_channels // 2)) # Random projection matrix
     
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        with autocast(device_type=str(device), enabled=False):
+        with autocast(device_type='cuda', enabled=False):
             assert input.ndim == 1
             f = 2 * torch.pi * input.unsqueeze(1) @ self.weight
             return torch.cat([f.cos(), f.sin()], dim=-1) 
@@ -83,9 +84,16 @@ class ResidualBlock(nn.Module):
         super().__init__()
         self.noise_mlp = nn.Sequential(nn.Linear(cond_channels, nb_channels_in*4), nn.ReLU(), nn.Linear(nb_channels_in*4, nb_channels_in*4))
         self.noise_proj = nn.Linear(nb_channels_in*4, 2*nb_channels_in)
-        self.norm1 = nn.BatchNorm2d(nb_channels_in)
+        default_grps = 32
+        if nb_channels_in < default_grps:
+            self.norm1 = nn.GroupNorm(4, nb_channels_in)
+        else:
+            self.norm1 = nn.GroupNorm(default_grps, nb_channels_in)
         self.conv1 = nn.Conv2d(nb_channels_in, nb_channels_out, kernel_size=3, stride=1, padding=1)
-        self.norm2 = nn.BatchNorm2d(nb_channels_out)
+        if nb_channels_in < default_grps:
+            self.norm2 = nn.GroupNorm(4, nb_channels_out)
+        else:
+            self.norm2 = nn.GroupNorm(default_grps, nb_channels_out)
         self.conv2 = nn.Conv2d(nb_channels_out, nb_channels_out, kernel_size=3, stride=1, padding=1)
         self.dim = nn.Identity()
         if nb_channels_in != nb_channels_out:
@@ -150,7 +158,7 @@ def build_sigma_schedule(steps, rho=7, sigma_min=2e-3, sigma_max=80):
     return sigmas
 
 def train_model(loader: Dataset, info: DataInfo, model : nn.Module, nb_epochs):
-    opt = torch.optim.Adam(model.parameters())
+    opt = torch.optim.Adam(model.parameters(), 2e-4)
     scaler = GradScaler()
     losses = []
     for e in range(nb_epochs):
@@ -168,7 +176,7 @@ def train_model(loader: Dataset, info: DataInfo, model : nn.Module, nb_epochs):
         for load in loader:
             x = load[0]
             x = x.to(device)
-            opt.zero_grad()
+            opt.zero_grad(set_to_none=True)
 
             sigma = sample_sigma(x.shape[0]).to(device)
             noise = torch.normal(mean=torch.zeros(x.shape), std=torch.ones(x.shape)).to(device)
@@ -182,6 +190,8 @@ def train_model(loader: Dataset, info: DataInfo, model : nn.Module, nb_epochs):
                 res = model.forward(c_in * noisy, c_noise)
                 loss = crit(res, (x - c_skip * noisy) / c_out)
             scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(opt)
             scaler.update()
             if batch_count % 50 == 0:
@@ -190,6 +200,7 @@ def train_model(loader: Dataset, info: DataInfo, model : nn.Module, nb_epochs):
                     break
             batch_count += 1
         losses.append(loss)
+    return losses
 
 def denoise(x, sigma, model, device):
     return sigma_skip(sigma) * x + sigma_out(sigma) * model.forward(sigma_in(sigma) * x, sigma_noise(sigma).unsqueeze(0).to(device))
@@ -218,8 +229,11 @@ def euler_sampling(sigmas, model, device):
 
 if __name__ == '__main__': # To allow multiple worker threads in data-loading
     model = Model(info.image_channels, 32, 2, 64)
+    saved = torch.load("./checkpoints/checkpoint_20251209_193930.tar")
+    model.load_state_dict(saved['model_state_dict'])
     model = model.to(device)
     input = dl[0]
-    train_model(input, info, model, 500)
+    losses = train_model(input, info, model, 500 - saved['epoch'])
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     torch.save(model.state_dict(), f'./diffusion_model{timestamp}.pth')
+    np.save('Loss_history_epoch.npy', np.array(losses)).cpu()
