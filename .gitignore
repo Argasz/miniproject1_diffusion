@@ -1,4 +1,5 @@
 data/
 __pycache__/
-test*.jpg
-test*.png
+*.jpg
+*.png
+instructions.ipynb*

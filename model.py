@@ -169,6 +169,7 @@ def train_model(loader: Dataset, info: DataInfo, model : nn.Module, nb_epochs):
     opt = torch.optim.Adam(model.parameters(), 2e-4)
     scaler = GradScaler()
     losses = []
+    nans = False
     for e in range(nb_epochs):
         if e == nb_epochs / 2: #Save one checkpoint for now
             timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -206,36 +207,41 @@ def train_model(loader: Dataset, info: DataInfo, model : nn.Module, nb_epochs):
             scaler.update()
             if batch_count % 50 == 0:
                 if check_for_nans(model):
+                    nans = True
                     print('Stopped training due to nans')
                     break
             batch_count += 1
+        if nans:
+            break
         losses.append(loss)
     return losses
 
 def denoise(x, sigma, model, device, class_labels):
     return sigma_skip(sigma) * x + sigma_out(sigma) * model.forward(sigma_in(sigma) * x, sigma_noise(sigma).expand(x.shape[0]).to(device), class_labels)
 
-def sample_denoised(model, device, class_labels, batch_size):
+def sample_denoised(model, device, class_labels, batch_size, guidance_scale):
     sigmas = build_sigma_schedule(1000)
-    return euler_sampling(sigmas, model, device, class_labels, batch_size)
+    return euler_sampling(sigmas, model, device, class_labels, batch_size, guidance_scale)
 
 
-def euler_sampling(sigmas, model, device, class_labels, batch_size):
+def euler_sampling(sigmas, model, device, class_labels, batch_size, guidance_scale):
     denoise_steps = []
     x = torch.randn(batch_size, 1, 32, 32) * sigmas[0]  # Initialize with pure gaussian noise ~ N(0, sigmas[0])
 
-    x = x.repeat(2,1,1,1)
     class_labels = torch.cat((class_labels, torch.tensor([10] * batch_size).to(device)))
     x = x.to(device)
+
     sigmas = sigmas.to(device)
     for i, sigma in enumerate(sigmas):
-        
+        batch = x.repeat(2,1,1,1)
         with torch.no_grad():
-            x_denoised = denoise(x, sigma, model, device, class_labels)  
+            x_denoised = denoise(batch, sigma, model, device, class_labels)  
             # Where D(x, sigma) = cskip(sigma) * x + cout(sigma) * F(cin(sigma) * x, cnoise(sigma)) 
             # and F(.,.) is your neural network
+        cond, uncond = x_denoised.split(batch_size, dim=0)
+        pred = uncond + guidance_scale * (cond - uncond)
         sigma_next = sigmas[i + 1] if i < len(sigmas) - 1 else 0
-        d = (x - x_denoised) / sigma
+        d = (x - pred) / sigma
         
         x = x + d * (sigma_next - sigma)  # Perform one step of Euler's method
         denoise_steps.append(x_denoised.cpu())
