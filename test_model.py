@@ -8,14 +8,26 @@ def save_image(image, fname):
     img = model.make_grid(img)
     img = Image.fromarray(img.permute(1, 2, 0).cpu().numpy())
     img.save(fname)
-
+LABEL_LOOKUP = {
+    'T-shirt':0,
+    'Trousers':1,
+    'Pullover': 2,
+    'Dress': 3,
+    'Coat': 4,
+    'Sandal':5,
+    'Shirt':6,
+    'Sneaker':7,
+    'Bag':8,
+    'Ankle boot':9
+}
 gpu = torch.cuda.is_available()
 device = torch.device('cuda:0' if gpu else 'cpu')
 
-saved = torch.load('./diffusion_model20251209_223921.pth')
-diffusion = model.Model(1, 32, 2, 64).to(device)
+saved = torch.load('./diffusion_model20251210_210536.pth')
+diffusion = model.Model(1, 32, 2, 64, 10).to(device)
 diffusion.load_state_dict(saved)
-denoised_image, denoise_steps = model.sample_denoised(diffusion, device)
+class_labels = torch.tensor([0,1,2,3,4,5,6,7]).to(device)
+denoised_image, denoise_steps = model.sample_denoised(diffusion, device, class_labels, 8)
 
 # dl, info = model.load_dataset_and_make_dataloaders(
 #         dataset_name='FashionMNIST',
