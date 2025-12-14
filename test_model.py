@@ -76,7 +76,7 @@ LABEL_LOOKUP = {
     'T-shirt':0,
     'Trousers':1,
     'Pullover': 2,
-    'Dress': 3,
+    'Dress': 3,W
     'Coat': 4,
     'Sandal':5,
     'Shirt':6,
