@@ -21,7 +21,7 @@ if __name__ == '__main__':
         dataset_name='FashionMNIST',
         root_dir='data', # choose the directory to store the data 
         batch_size=batch_size,
-        num_workers=0,   # you can use more workers if you see the GPU is waiting for the batches
+        num_workers=6,   # you can use more workers if you see the GPU is waiting for the batches
         pin_memory=gpu,  # use pin memory if you're planning to move the data to GPU
     )
 
@@ -50,7 +50,6 @@ class Model(nn.Module):
         self.noise_emb = NoiseEmbedding(cond_channels)
         self.class_embedding = nn.Embedding(num_classes + 1, nb_channels*2)
         self.conv_in = nn.Conv2d(image_channels, nb_channels, kernel_size=3, padding=1)
-        #self.blocks = nn.ModuleList([ResidualBlock(nb_channels, cond_channels) for _ in range(num_blocks)])
         self.downres1 = DownResBlock(nb_channels, nb_channels* 2, cond_channels)
         self.downres2 = DownResBlock(nb_channels * 2, nb_channels * 4, cond_channels)
         self.up1 = UpResBlock(192, nb_channels * 2, (16 , 16), cond_channels)
@@ -146,7 +145,7 @@ def sigma_in(sigma, sigma_data=0.6627):
 def sigma_out(sigma, sigma_data = 0.6627):
     return sigma * sigma_data / torch.sqrt(sigma**2 + sigma_data ** 2)
 
-def sigma_skip(sigma, sigma_data = 0.6627): # Magic number from the data, fix later
+def sigma_skip(sigma, sigma_data = 0.6627):
     return sigma_data ** 2 / (sigma_data**2 + sigma ** 2)
 
 def sigma_noise(sigma):
@@ -236,8 +235,6 @@ def euler_sampling(sigmas, model, device, class_labels, batch_size, guidance_sca
         batch = x.repeat(2,1,1,1)
         with torch.no_grad():
             x_denoised = denoise(batch, sigma, model, device, class_labels)  
-            # Where D(x, sigma) = cskip(sigma) * x + cout(sigma) * F(cin(sigma) * x, cnoise(sigma)) 
-            # and F(.,.) is your neural network
         cond, uncond = x_denoised.split(batch_size, dim=0)
         pred = uncond + guidance_scale * (cond - uncond)
         sigma_next = sigmas[i + 1] if i < len(sigmas) - 1 else 0
@@ -249,8 +246,6 @@ def euler_sampling(sigmas, model, device, class_labels, batch_size, guidance_sca
 
 if __name__ == '__main__': # To allow multiple worker threads in data-loading
     model = Model(info.image_channels, 32, 2, 64, 10)
-    #saved = torch.load("./checkpoints/checkpoint_20251209_193930.tar")
-    #model.load_state_dict(saved['model_state_dict'])
     model = model.to(device)
     input = dl[0]
     losses = train_model(input, info, model, 500)
